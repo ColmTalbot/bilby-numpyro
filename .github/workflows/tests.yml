@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.10", "3.11"]
+        python-version: ["3.10", "3.11", "3.12"]
     runs-on: ubuntu-latest
 
     steps:
@@ -30,7 +30,9 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install .[test]
+        # install bilby directly from source to support plugins
+        python -m pip install git+https://git.ligo.org/lscsoft/bilby.git
+        python -m pip install .[test]
     - name: Test with pytest
       run: |
         python -m pytest
