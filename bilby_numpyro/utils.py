@@ -93,7 +93,7 @@ def sample_prior(priors, delta_fns):
     base = Normal(0, 1)
     for k, v in priors.items():
         if k in delta_fns:
-            parameters[k] = float(deterministic(k, v.mean))
+            parameters[k] = deterministic(k, v.mean)
             continue
         try:
             temp = sample(f"{k}_scaled", Normal(0, 1))
