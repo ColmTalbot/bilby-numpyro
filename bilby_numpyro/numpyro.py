@@ -1,15 +1,18 @@
 import inspect
 import os
 from importlib import import_module
+import pickle
 
 import arviz
 import jax
+import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
 import numpyro.infer
 from bilby.core.sampler.base_sampler import Sampler, signal_wrapper
-from bilby.core.utils.io import check_directory_exists_and_if_not_mkdir
-from numpyro.infer import MCMC, Predictive
+from bilby.core.utils.io import check_directory_exists_and_if_not_mkdir, logger
+from numpyro.infer import MCMC, Predictive, log_likelihood
+
 
 from .utils import construct_numpyro_model, generic_bilby_likelihood_function
 
@@ -39,6 +42,10 @@ class NumPyro(Sampler):
         verbose=True,
         seed=1234,
         plot_trace=True,
+        check_point=False,
+        n_check_point=None,
+        thinning=1,
+        resume=False
     )
 
     @signal_wrapper
@@ -60,17 +67,33 @@ class NumPyro(Sampler):
         validate_model(numpyro_model, validate_key)
 
         sampler_class = getattr(numpyro.infer, self.kwargs["sampler_name"])
-        sampler = self.evaluate_with_kwargs(sampler_class, numpyro_model)
-        mcmc = self.evaluate_with_kwargs(MCMC, sampler)
-        mcmc.run(sample_key)
+        
+        if self.kwargs['check_point'] and self.kwargs['n_check_point'] is not None:   
+            logger.info("Running numpyro with checkpointing enabled") 
+            self.kwargs['num_total_samples'] = self.kwargs['num_samples']
+            self.kwargs['num_samples'] = self.kwargs['n_check_point']
 
-        samples = mcmc.get_samples()
+            sampler = self.evaluate_with_kwargs(sampler_class, numpyro_model)
+            mcmc = self.evaluate_with_kwargs(MCMC, sampler)
+            mcmc, samples, log_likes = self._run_with_checkpointing(mcmc, sample_key)
+            
+        else:
+            logger.info("Running numpyro without checkpointing enabled")
+            
+            sampler = self.evaluate_with_kwargs(sampler_class, numpyro_model)
+            mcmc = self.evaluate_with_kwargs(MCMC, sampler)
+            mcmc.run(sample_key)
+            samples = mcmc.get_samples()
+            log_likes = log_likelihood(mcmc.sampler.model, mcmc.get_samples())
+
+
         predictive = Predictive(numpyro_model, samples)(predictive_key)
         predictive = {
             key: predictive[key]
             for key in set(predictive.keys()).difference(samples.keys())
         }
-        azdata = arviz.from_numpyro(mcmc, posterior_predictive=predictive)
+        azdata = arviz.from_dict(samples, posterior_predictive=predictive, log_likelihood=log_likes)
+
         keys = [key for key in azdata.posterior.keys() if not key.endswith("_scaled")]
 
         if self.kwargs["plot_trace"]:
@@ -81,6 +104,7 @@ class NumPyro(Sampler):
         self.result.log_likelihood_evaluations = azdata.log_likelihood[
             "log_likelihood"
         ].values.flatten()
+
         return self.result
 
     @property
@@ -146,6 +170,53 @@ class NumPyro(Sampler):
         """
         pass
 
+    def _run_with_checkpointing(self, mcmc, sample_key):
+
+        # first run
+        if not os.path.isfile(self.outdir + "/numpyro_checkpt.pkl"):
+            
+            mcmc.run(sample_key)
+
+            checkpt = {}
+            checkpt['samples'] = mcmc.get_samples()
+            checkpt['state'] = mcmc.last_state
+            checkpt['num_samples'] = (checkpt['samples'][list(checkpt['samples'].keys())[0]]).size
+            checkpt['log_likelihood'] = log_likelihood(mcmc.sampler.model, mcmc.get_samples())
+
+            logger.info('checkpointing at ' + str(checkpt['num_samples']) + ' samples')
+            with open(self.outdir + "/numpyro_checkpt.pkl", 'wb') as f:
+                pickle.dump(checkpt, f)
+
+        else:
+            logger.info('loading from checkpoint')
+            with open(self.outdir + "/numpyro_checkpt.pkl", 'rb') as f:
+                checkpt = pickle.load(f)
+
+        while checkpt['num_samples'] < self.kwargs['num_total_samples']:
+
+            # fix checkpoint state as post warmup state
+            mcmc.post_warmup_state = checkpt['state'] 
+            mcmc.run(sample_key)
+
+            new_samples = mcmc.get_samples()
+            new_state = mcmc.last_state
+            new_log_likelihoods = log_likelihood(mcmc.sampler.model, mcmc.get_samples())
+
+            for key in checkpt['samples'].keys():
+                checkpt['samples'][key] = jnp.append(checkpt['samples'][key], 
+                                                     new_samples[key])
+            
+            checkpt['log_likelihood']['log_likelihood'] = jnp.append(checkpt['log_likelihood']['log_likelihood'], 
+                                                                     new_log_likelihoods['log_likelihood'])
+            checkpt['state'] = new_state
+            checkpt['num_samples'] = (checkpt['samples'][list(checkpt['samples'].keys())[0]]).size
+            
+            logger.info('checkpointing at ' + str(checkpt['num_samples']) + ' samples')
+            with open(self.outdir + "/numpyro_checkpt.pkl", 'wb') as f:
+                pickle.dump(checkpt, f)
+
+        return mcmc, checkpt['samples'], checkpt['log_likelihood']
+    
 
 def validate_model(numpyro_model, rng_key):
     from numpyro import handlers
