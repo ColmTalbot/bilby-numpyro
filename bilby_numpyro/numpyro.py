@@ -201,7 +201,7 @@ class NumPyro(Sampler):
             checkpoint["log_likelihood"] = log_likelihood(
                 mcmc.sampler.model, mcmc.get_samples()
             )
-            checkpoint['new_key'] = new_key
+            checkpoint["new_key"] = new_key
 
             logger.info(
                 "checkpointing at "
@@ -218,7 +218,7 @@ class NumPyro(Sampler):
 
         while checkpoint["num_samples"] < self.kwargs["num_total_samples"]:
 
-            new_key, sample_key = jax.random.split(checkpoint['new_key'], 2)
+            new_key, sample_key = jax.random.split(checkpoint["new_key"], 2)
 
             # fix checkpoint state as post warmup state
             mcmc.post_warmup_state = checkpoint["state"]
@@ -243,8 +243,8 @@ class NumPyro(Sampler):
             checkpoint["num_samples"] = (
                 checkpoint["samples"][list(checkpoint["samples"].keys())[0]]
             ).size
-            checkpoint['new_key'] = new_key
-            
+            checkpoint["new_key"] = new_key
+
             logger.info(
                 "checkpointing at "
                 + str(checkpoint["num_samples"])
