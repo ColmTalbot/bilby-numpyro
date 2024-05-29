@@ -1,7 +1,7 @@
 import inspect
 import os
 from importlib import import_module
-import pickle
+import dill as pickle
 
 import arviz
 import jax
@@ -77,6 +77,7 @@ class NumPyro(Sampler):
             mcmc = self.evaluate_with_kwargs(MCMC, sampler)
             mcmc, samples, log_likes = self._run_with_checkpointing(mcmc, sample_key)
             
+            self.kwargs["num_samples"] = self.kwargs.pop("num_total_samples")
         else:
             logger.info("Running numpyro without checkpointing enabled")
             
@@ -172,50 +173,52 @@ class NumPyro(Sampler):
 
     def _run_with_checkpointing(self, mcmc, sample_key):
 
+        checkpoint_file = self.outdir + "/numpyro_checkpoint.pkl"
+
         # first run
-        if not os.path.isfile(self.outdir + "/numpyro_checkpt.pkl"):
+        if not os.path.isfile(checkpoint_file):
             
             mcmc.run(sample_key)
 
-            checkpt = {}
-            checkpt['samples'] = mcmc.get_samples()
-            checkpt['state'] = mcmc.last_state
-            checkpt['num_samples'] = (checkpt['samples'][list(checkpt['samples'].keys())[0]]).size
-            checkpt['log_likelihood'] = log_likelihood(mcmc.sampler.model, mcmc.get_samples())
+            checkpoint = {}
+            checkpoint['samples'] = mcmc.get_samples()
+            checkpoint['state'] = mcmc.last_state
+            checkpoint['num_samples'] = (checkpoint['samples'][list(checkpoint['samples'].keys())[0]]).size
+            checkpoint['log_likelihood'] = log_likelihood(mcmc.sampler.model, mcmc.get_samples())
 
-            logger.info('checkpointing at ' + str(checkpt['num_samples']) + ' samples')
-            with open(self.outdir + "/numpyro_checkpt.pkl", 'wb') as f:
-                pickle.dump(checkpt, f)
+            logger.info('checkpointing at ' + str(checkpoint['num_samples']) + ' samples')
+            with open(checkpoint_file, 'wb') as f:
+                pickle.dump(checkpoint, f)
 
         else:
             logger.info('loading from checkpoint')
-            with open(self.outdir + "/numpyro_checkpt.pkl", 'rb') as f:
-                checkpt = pickle.load(f)
+            with open(checkpoint_file, 'rb') as f:
+                checkpoint = pickle.load(f)
 
-        while checkpt['num_samples'] < self.kwargs['num_total_samples']:
+        while checkpoint['num_samples'] < self.kwargs['num_total_samples']:
 
             # fix checkpoint state as post warmup state
-            mcmc.post_warmup_state = checkpt['state'] 
+            mcmc.post_warmup_state = checkpoint['state'] 
             mcmc.run(sample_key)
 
             new_samples = mcmc.get_samples()
             new_state = mcmc.last_state
             new_log_likelihoods = log_likelihood(mcmc.sampler.model, mcmc.get_samples())
 
-            for key in checkpt['samples'].keys():
-                checkpt['samples'][key] = jnp.append(checkpt['samples'][key], 
+            for key in checkpoint['samples'].keys():
+                checkpoint['samples'][key] = jnp.append(checkpoint['samples'][key], 
                                                      new_samples[key])
             
-            checkpt['log_likelihood']['log_likelihood'] = jnp.append(checkpt['log_likelihood']['log_likelihood'], 
+            checkpoint['log_likelihood']['log_likelihood'] = jnp.append(checkpoint['log_likelihood']['log_likelihood'], 
                                                                      new_log_likelihoods['log_likelihood'])
-            checkpt['state'] = new_state
-            checkpt['num_samples'] = (checkpt['samples'][list(checkpt['samples'].keys())[0]]).size
+            checkpoint['state'] = new_state
+            checkpoint['num_samples'] = (checkpoint['samples'][list(checkpoint['samples'].keys())[0]]).size
             
-            logger.info('checkpointing at ' + str(checkpt['num_samples']) + ' samples')
-            with open(self.outdir + "/numpyro_checkpt.pkl", 'wb') as f:
-                pickle.dump(checkpt, f)
+            logger.info('checkpointing at ' + str(checkpoint['num_samples']) + ' samples')
+            with open(checkpoint_file, 'wb') as f:
+                pickle.dump(checkpoint, f)
 
-        return mcmc, checkpt['samples'], checkpt['log_likelihood']
+        return mcmc, checkpoint['samples'], checkpoint['log_likelihood']
     
 
 def validate_model(numpyro_model, rng_key):
