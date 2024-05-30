@@ -43,5 +43,8 @@ def test_run_sampler(bilby_likelihood, bilby_priors, tmp_path, sampler_kwargs):
         priors=bilby_priors,
         sampler="numpyro",    # This should match the name of the sampler
         outdir=outdir,
+        num_samples=1000,
+        check_point=True,
+        n_check_point=200,
         **sampler_kwargs,
     )
