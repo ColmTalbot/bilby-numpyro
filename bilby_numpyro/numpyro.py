@@ -183,7 +183,7 @@ class NumPyro(Sampler):
 
     def _run_with_checkpointing(self, mcmc, sample_key):
 
-        checkpoint_file = self.outdir + "/numpyro_checkpoint.pkl"
+        checkpoint_file = f"{self.outdir}/numpyro_checkpoint.pkl"
 
         # first run
         if not os.path.isfile(checkpoint_file):
