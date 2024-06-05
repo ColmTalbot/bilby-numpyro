@@ -46,6 +46,9 @@ class NumPyro(Sampler):
         n_check_point=None,
         thinning=1,
         resume=False,
+        postprocess_fn=None,
+        chain_method='parallel',
+        jit_model_args=False,
     )
 
     @signal_wrapper
