@@ -154,7 +154,7 @@ def construct_numpyro_model(
     def model():
         parameters = sample_prior(priors, delta_fns)
         ln_l = generic_bilby_likelihood_function(
-            likelihood, priors, use_ratio=kwargs.get("use_ratio", True)
+            likelihood, parameters, use_ratio=kwargs.get("use_ratio", True)
         )
         ln_l = jnp.nan_to_num(ln_l, nan=-jnp.inf)
         sample("log_likelihood", Unit(ln_l), obs=ln_l)

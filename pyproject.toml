@@ -16,7 +16,7 @@ classifiers = [
 ]
 dependencies = [
     "arviz",
-    "bilby>2.2.4",
+    "bilby>2.7",
     "jax",
     "numpy",
     "numpyro",
