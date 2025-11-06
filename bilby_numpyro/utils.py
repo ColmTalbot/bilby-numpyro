@@ -99,7 +99,7 @@ def bilby_to_numpyro_priors(priors):
     return jpriors
 
 
-def generic_bilby_likelihood_function(likelihood, parameters, use_ratio=True):
+def generic_bilby_likelihood_function(likelihood, parameters, *, use_ratio=True):
     """
     A wrapper to allow a :code:`Bilby` likelihood to be used with :code:`jax`.
 
@@ -153,9 +153,7 @@ def construct_numpyro_model(
 
     def model():
         parameters = sample_prior(priors, delta_fns)
-        ln_l = generic_bilby_likelihood_function(
-            likelihood, parameters, use_ratio=kwargs.get("use_ratio", True)
-        )
+        ln_l = likelihood_func(likelihood, parameters, **kwargs)
         ln_l = jnp.nan_to_num(ln_l, nan=-jnp.inf)
         sample("log_likelihood", Unit(ln_l), obs=ln_l)
 
