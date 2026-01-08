@@ -11,7 +11,7 @@ import numpy as np
 import numpyro.infer
 from bilby.core.sampler.base_sampler import Sampler, signal_wrapper
 from bilby.core.utils.io import check_directory_exists_and_if_not_mkdir, logger
-from numpyro.infer import MCMC, Predictive, log_likelihood
+from numpyro.infer import MCMC, Predictive, SVI, Trace_ELBO, log_likelihood
 
 
 from .utils import construct_numpyro_model, generic_bilby_likelihood_function
@@ -36,6 +36,7 @@ class NumPyro(Sampler):
 
     default_kwargs = dict(
         sampler_name="NUTS",
+        engine="MCMC",
         num_warmup=500,
         num_samples=1000,
         num_chains=1,
@@ -49,6 +50,7 @@ class NumPyro(Sampler):
         postprocess_fn=None,
         chain_method='parallel',
         jit_model_args=False,
+        importance_resample=False,
     )
 
     @signal_wrapper
@@ -63,7 +65,7 @@ class NumPyro(Sampler):
 
         check_directory_exists_and_if_not_mkdir(self.outdir)
 
-        rng_key = jax.random.PRNGKey(self.kwargs[self.sampling_seed_key])
+        rng_key = jax.random.key(self.kwargs[self.sampling_seed_key])
         validate_key, sample_key, predictive_key = jax.random.split(rng_key, 3)
 
         numpyro_model = self.model
@@ -86,7 +88,7 @@ class NumPyro(Sampler):
             )
 
             self.kwargs["num_samples"] = self.kwargs.pop("num_total_samples")
-        else:
+        elif self.kwargs["engine"] == "MCMC":
             logger.info("Running numpyro without checkpointing enabled")
 
             sampler = self.evaluate_with_kwargs(sampler_class, numpyro_model)
@@ -94,6 +96,71 @@ class NumPyro(Sampler):
             mcmc.run(sample_key)
             samples = mcmc.get_samples()
             log_likes = log_likelihood(mcmc.sampler.model, mcmc.get_samples())
+        elif self.kwargs["engine"] == "SVI":
+            from numpyro.infer.autoguide import (
+                AutoMultivariateNormal,
+                AutoBNAFNormal,
+                AutoIAFNormal,
+            )
+            guide = AutoBNAFNormal(
+            # guide = AutoIAFNormal(
+                numpyro_model,
+                num_flows=8,
+                hidden_factors=[16, 16],
+            )
+            # guide = AutoMultivariateNormal(numpyro_model)
+
+            optimizer = numpyro.optim.Adam(step_size=0.0005)
+            svi = SVI(numpyro_model, guide, optimizer, loss=Trace_ELBO(num_particles=100))
+            svi_result = svi.run(sample_key, self.kwargs["num_warmup"], None)
+            params = svi_result.params
+            # use guide to make predictive
+            predictive = Predictive(numpyro_model, guide=guide, params=params, num_samples=self.kwargs["num_samples"])
+            samples = predictive(predictive_key, data=None)
+            # get posterior samples
+            predictive = Predictive(guide, params=params, num_samples=self.kwargs["num_samples"])
+            posterior_samples = predictive(predictive_key, data=None)
+            # use posterior samples to make predictive
+            predictive = Predictive(numpyro_model, posterior_samples, params=params, num_samples=self.kwargs["num_samples"])
+            samples = predictive(predictive_key, data=None)
+            log_likes = {"log_likelihood": samples.pop("log_likelihood")}
+
+            if self.kwargs["importance_resample"]:
+                @jax.vmap
+                def ln_post_fn(parameters):
+                    ln_prior = -sum([value**2 for key, value in parameters.items() if key.endswith("_scaled")]) / 2
+                    if self.use_ratio:
+                        ln_like = self.likelihood.log_likelihood_ratio(parameters)
+                    else:
+                        ln_like = self.likelihood.log_likelihood(parameters)
+                    return ln_prior + ln_like
+
+                points = guide.sample_posterior(validate_key, svi_result.params, sample_shape=(self.kwargs["num_samples"],))
+                # keys = [foo for foo in guide.prototype_trace if foo.endswith("_scaled")]
+                guide_params = jnp.array([points[key] for key in guide.prototype_trace if key.endswith("_scaled")])
+                # guide_params = jnp.array([
+                #     value for key, value in points.items() if key.endswith("_scaled")
+                # ])
+                post = guide.get_posterior(svi_result.params)
+                ln_post = ln_post_fn(points)
+                ln_proposal = post.log_prob(guide_params.T)
+                ln_weights = ln_post - ln_proposal
+                weights = jnp.exp(ln_weights - jnp.nanmax(ln_weights))
+                ess = (jnp.sum(weights))**2 / jnp.sum(weights**2)
+                logger.info(f"SVI effective sample size estimate: {ess:.1f} / {self.kwargs['num_samples']}")
+                keep = weights > np.random.uniform(0, max(weights), len(weights))
+                samples = {key: values[keep] for key, values in points.items()}
+
+            plt.plot(svi_result.losses)
+            # plt.yscale("log")
+            plt.xlabel("Step")
+            plt.ylabel("ELBO Loss")
+            plt.savefig(os.path.join(self.outdir, f"{self.label}_svi_loss.png"))
+            plt.close()
+        else:
+            raise NotImplementedError(
+                f"Unknown engine {self.kwargs['engine']}"
+            )            
 
         predictive = Predictive(numpyro_model, samples)(predictive_key)
         predictive = {
@@ -148,11 +215,11 @@ class NumPyro(Sampler):
         return likelihood_func
 
     def filter_kwargs(self, func):
-        return {
-            key: self.kwargs[key]
-            for key in inspect.signature(func).parameters.keys()
-            if key in self.kwargs
-        }
+        keys = inspect.signature(func).parameters.keys()
+        kwargs = {key: self.kwargs[key] for key in keys if key in self.kwargs}
+        if "use_ratio" in keys:
+            kwargs["use_ratio"] = self.use_ratio
+        return kwargs
 
     def evaluate_with_kwargs(self, func, *args, **kwargs):
         return func(*args, **kwargs, **self.filter_kwargs(func))

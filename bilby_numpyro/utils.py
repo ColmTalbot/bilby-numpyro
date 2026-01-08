@@ -151,10 +151,9 @@ def construct_numpyro_model(
     }
     priors = bilby_to_numpyro_priors(priors)
 
-    def model():
+    def model(*args, **model_kwargs):
         parameters = sample_prior(priors, delta_fns)
         ln_l = likelihood_func(likelihood, parameters, **kwargs)
-        ln_l = jnp.nan_to_num(ln_l, nan=-jnp.inf)
         sample("log_likelihood", Unit(ln_l), obs=ln_l)
 
     return model
