@@ -11,9 +11,9 @@ import numpy as np
 import numpyro.infer
 from bilby.core.sampler.base_sampler import Sampler, signal_wrapper
 from bilby.core.utils.io import check_directory_exists_and_if_not_mkdir, logger
-from numpyro.infer import MCMC, Predictive, SVI, Trace_ELBO, log_likelihood
+from numpyro.infer import MCMC, Predictive, Trace_ELBO, log_likelihood
 
-
+from .svi import SVI
 from .utils import construct_numpyro_model, generic_bilby_likelihood_function
 
 
@@ -42,6 +42,7 @@ class NumPyro(Sampler):
         num_chains=1,
         verbose=True,
         seed=1234,
+        num_particles=1,
         plot_trace=True,
         check_point=False,
         n_check_point=None,
@@ -51,6 +52,9 @@ class NumPyro(Sampler):
         chain_method='parallel',
         jit_model_args=False,
         importance_resample=False,
+        svi_temps=None,
+        guide_model="AutoMultivariateNormal",
+        guide_kwargs=dict(),
     )
 
     @signal_wrapper
@@ -97,33 +101,50 @@ class NumPyro(Sampler):
             samples = mcmc.get_samples()
             log_likes = log_likelihood(mcmc.sampler.model, mcmc.get_samples())
         elif self.kwargs["engine"] == "SVI":
-            from numpyro.infer.autoguide import (
-                AutoMultivariateNormal,
-                AutoBNAFNormal,
-                AutoIAFNormal,
-            )
-            guide = AutoBNAFNormal(
-            # guide = AutoIAFNormal(
-                numpyro_model,
-                num_flows=8,
-                hidden_factors=[16, 16],
-            )
-            # guide = AutoMultivariateNormal(numpyro_model)
+            from numpyro.infer import autoguide
 
-            optimizer = numpyro.optim.Adam(step_size=0.0005)
-            svi = SVI(numpyro_model, guide, optimizer, loss=Trace_ELBO(num_particles=100))
-            svi_result = svi.run(sample_key, self.kwargs["num_warmup"], None)
-            params = svi_result.params
-            # use guide to make predictive
-            predictive = Predictive(numpyro_model, guide=guide, params=params, num_samples=self.kwargs["num_samples"])
-            samples = predictive(predictive_key, data=None)
-            # get posterior samples
-            predictive = Predictive(guide, params=params, num_samples=self.kwargs["num_samples"])
-            posterior_samples = predictive(predictive_key, data=None)
-            # use posterior samples to make predictive
-            predictive = Predictive(numpyro_model, posterior_samples, params=params, num_samples=self.kwargs["num_samples"])
-            samples = predictive(predictive_key, data=None)
-            log_likes = {"log_likelihood": samples.pop("log_likelihood")}
+            if isinstance(self.kwargs["guide_model"], str):
+                guide_class = getattr(autoguide, self.kwargs["guide_model"])
+            else:
+                guide_class = self.kwargs["guide_model"]
+            guide = guide_class(numpyro_model, **self.kwargs["guide_kwargs"])
+
+            optimizer = numpyro.optim.Adam(step_size=1e-3)
+            svi = SVI(numpyro_model, guide, optimizer, loss=Trace_ELBO(self.kwargs["num_particles"]))
+            update_func = svi.make_update(forward_mode_differentiation=False, stable_update=True)
+            sample_key, svi_key, state_key = jax.random.split(sample_key, 3)
+            svi_state = svi.init(state_key, init_params=None, beta=jnp.array(1, dtype=jnp.float32))
+            svi_state, loss = update_func(svi_state, None)
+
+            losses = jnp.array([loss])
+            temps = self.kwargs["svi_temps"] if self.kwargs["svi_temps"] is not None else []
+            for temp in temps:
+                svi_state.kwargs["beta"] = jnp.array(temp)
+                sample_key, svi_key = jax.random.split(sample_key)
+                svi_result = svi.run(svi_key, self.kwargs["num_warmup"] // len(temps), None, init_state=svi_state, update_func=update_func)
+                svi_state = svi_result.state
+                losses = jnp.concatenate([losses, svi_result.losses])
+                plt.plot(losses)
+                plt.xlabel("Step")
+                plt.ylabel("ELBO Loss")
+                plt.savefig(os.path.join(self.outdir, f"{self.label}_svi_loss_{svi_state.kwargs['beta']:.1f}.png"))
+                plt.close()
+
+            svi_result = svi.run(sample_key, self.kwargs["num_warmup"], None, init_state=svi_state, update_func=update_func)
+
+            losses = jnp.concatenate([losses, svi_result.losses])
+            plt.plot(losses)
+            plt.xlabel("Step")
+            plt.ylabel("ELBO Loss")
+            plt.savefig(os.path.join(self.outdir, f"{self.label}_svi_loss.png"))
+            plt.close()
+
+            samples = guide.sample_posterior(validate_key, svi_result.params, sample_shape=(self.kwargs["num_samples"],))
+            if self.use_ratio:
+                ln_likes = jax.vmap(self.likelihood.log_likelihood_ratio)(samples)
+            else:
+                ln_likes = jax.vmap(self.likelihood.log_likelihood)(samples)
+            log_likes = {"log_likelihood": ln_likes}
 
             if self.kwargs["importance_resample"]:
                 @jax.vmap
@@ -135,28 +156,17 @@ class NumPyro(Sampler):
                         ln_like = self.likelihood.log_likelihood(parameters)
                     return ln_prior + ln_like
 
-                points = guide.sample_posterior(validate_key, svi_result.params, sample_shape=(self.kwargs["num_samples"],))
-                # keys = [foo for foo in guide.prototype_trace if foo.endswith("_scaled")]
-                guide_params = jnp.array([points[key] for key in guide.prototype_trace if key.endswith("_scaled")])
-                # guide_params = jnp.array([
-                #     value for key, value in points.items() if key.endswith("_scaled")
-                # ])
+                guide_params = jnp.array([samples[key] for key in guide.prototype_trace if key.endswith("_scaled")])
                 post = guide.get_posterior(svi_result.params)
-                ln_post = ln_post_fn(points)
+                ln_post = ln_post_fn(samples)
                 ln_proposal = post.log_prob(guide_params.T)
                 ln_weights = ln_post - ln_proposal
                 weights = jnp.exp(ln_weights - jnp.nanmax(ln_weights))
                 ess = (jnp.sum(weights))**2 / jnp.sum(weights**2)
                 logger.info(f"SVI effective sample size estimate: {ess:.1f} / {self.kwargs['num_samples']}")
                 keep = weights > np.random.uniform(0, max(weights), len(weights))
-                samples = {key: values[keep] for key, values in points.items()}
+                samples = {key: values[keep] for key, values in samples.items()}
 
-            plt.plot(svi_result.losses)
-            # plt.yscale("log")
-            plt.xlabel("Step")
-            plt.ylabel("ELBO Loss")
-            plt.savefig(os.path.join(self.outdir, f"{self.label}_svi_loss.png"))
-            plt.close()
         else:
             raise NotImplementedError(
                 f"Unknown engine {self.kwargs['engine']}"
@@ -174,7 +184,8 @@ class NumPyro(Sampler):
         keys = [
             key
             for key in azdata.posterior.keys()
-            if not key.endswith("_scaled")
+            if key in self.priors
+            # if not key.endswith("_scaled")
         ]
 
         if self.kwargs["plot_trace"]:
